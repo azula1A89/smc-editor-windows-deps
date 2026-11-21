@@ -1,0 +1,179 @@
+name: Build dependencies
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: Full SMC Editor commit SHA
+        required: true
+        default: 07c13d0a86b15ccd0f046cb951d2cc7f9e2b1d48
+      release_tag:
+        description: New dependency release tag
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: read
+
+env:
+  VCPKG_COMMIT: 74f5ea45ca78988784b810ad9bbb148ea7ff76d8
+  ARCHIVE: smc-editor-windows-x64-vcpkg-cache.zip
+
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - name: Validate inputs
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if ($env:SOURCE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw "source_commit must be a full lowercase commit SHA."
+          }
+          if ($env:RELEASE_TAG -cnotmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "release_tag must have the form v1.2.3."
+          }
+
+      - name: Check out SMC Editor
+        uses: actions/checkout@v4
+        with:
+          repository: azula1A89/smc-editor
+          ref: ${{ inputs.source_commit }}
+          path: app
+
+      - name: Verify vcpkg baseline
+        shell: pwsh
+        run: |
+          $manifest = Get-Content app/vcpkg.json -Raw | ConvertFrom-Json
+          if ($manifest.'builtin-baseline' -cne $env:VCPKG_COMMIT) {
+            throw "The source baseline does not match the pinned vcpkg commit."
+          }
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 74f5ea45ca78988784b810ad9bbb148ea7ff76d8
+
+      - name: Build dependency cache
+        shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}/smc-deps/cache,readwrite
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/smc-deps/cache" | Out-Null
+          cmake -S app -B build -DBUILD_TESTING=OFF `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DSMC_EDITOR_USE_RELEASE_PKGCONFIG=ON `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect metadata and licenses
+        shell: pwsh
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          $stage = "$env:RUNNER_TEMP/smc-deps"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio C++ tools were not found." }
+          $msvc = Get-Content "$vs/VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt" -Raw
+          @(
+            "source_commit=$env:SOURCE_COMMIT"
+            "vcpkg_commit=$env:VCPKG_COMMIT"
+            "target_triplet=x64-windows-static"
+            "host_triplet=x64-windows"
+            "runner_image=$env:ImageOS"
+            "runner_image_version=$env:ImageVersion"
+            "msvc_version=$($msvc.Trim())"
+          ) | Set-Content "$stage/metadata.txt"
+          Get-ChildItem build/vcpkg_installed -Filter copyright -File -Recurse | ForEach-Object {
+            $relative = $_.FullName.Substring((Resolve-Path build/vcpkg_installed).Path.Length).TrimStart('\')
+            $destination = Join-Path "$stage/licenses" $relative
+            New-Item -ItemType Directory -Force (Split-Path $destination) | Out-Null
+            Copy-Item $_.FullName $destination
+          }
+          if (-not (Test-Path "$stage/licenses")) { throw "No installed license files found." }
+          tar -a -cf "$env:RUNNER_TEMP/$env:ARCHIVE" -C $stage .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash "$env:RUNNER_TEMP/$env:ARCHIVE" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:ARCHIVE" | Set-Content "$env:RUNNER_TEMP/$env:ARCHIVE.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-dependency-package
+          path: |
+            ${{ runner.temp }}/smc-editor-windows-x64-vcpkg-cache.zip
+            ${{ runner.temp }}/smc-editor-windows-x64-vcpkg-cache.zip.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  verify:
+    needs: build
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: azula1A89/smc-editor
+          ref: ${{ inputs.source_commit }}
+          path: app
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-dependency-package
+          path: ${{ runner.temp }}/package
+
+      - name: Verify and extract package
+        shell: pwsh
+        run: |
+          $archive = "$env:RUNNER_TEMP/package/$env:ARCHIVE"
+          $expected = ((Get-Content "$archive.sha256" -Raw).Trim() -split '\s+')[0]
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ine $expected) {
+            throw "Dependency package checksum mismatch."
+          }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/smc-deps" | Out-Null
+          tar -xf $archive -C "$env:RUNNER_TEMP/smc-deps"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: 74f5ea45ca78988784b810ad9bbb148ea7ff76d8
+
+      - name: Restore only from cache, build, and test
+        shell: pwsh
+        env:
+          VCPKG_BINARY_SOURCES: clear;files,${{ runner.temp }}/smc-deps/cache,read
+        run: |
+          cmake -S app -B build -DBUILD_TESTING=ON `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DSMC_EDITOR_USE_RELEASE_PKGCONFIG=ON `
+            -DVCPKG_INSTALL_OPTIONS=--only-binarycaching `
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build --config Release --target smc-editor dot_layout_tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build -C Release -R '^dot_layout_tests$' --output-on-failure
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-dependency-package
+          path: package
+      - name: Publish new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            package/smc-editor-windows-x64-vcpkg-cache.zip \
+            package/smc-editor-windows-x64-vcpkg-cache.zip.sha256 \
+            --title "$RELEASE_TAG" \
+            --notes "Built from azula1A89/smc-editor@$SOURCE_COMMIT. See metadata and licenses inside the archive."
